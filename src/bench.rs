@@ -18,7 +18,7 @@ pub trait Bench {
     fn is_symmetric(&self) -> bool { true }
 }
 
-pub fn run_bench(cores: &[CoreId], clock: &Clock, args: &CliArgs, bench: impl Bench) {
+pub fn run_bench(cores: &[CoreId], clock: &Clock, args: &CliArgs, bench: &impl Bench) {
     let num_samples = args.num_samples;
     let num_iterations = args.num_iterations;
 

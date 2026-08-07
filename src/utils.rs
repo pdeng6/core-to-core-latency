@@ -59,6 +59,36 @@ pub fn get_cpu_brand() -> Option<String> {
         .map(|c| c.as_str().to_string())
 }
 
+/// Translate a virtual address to a physical one via /proc/self/pagemap.
+///
+/// Where a cache line is tracked follows from its *physical* address, so this is
+/// what makes a `--slot` sweep interpretable. Needs CAP_SYS_ADMIN; returns None
+/// when we can't read it (non-root, non-Linux, page not present).
+#[cfg(target_os = "linux")]
+pub fn virt_to_phys(virt: usize) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let page_size = 4096;
+    let mut f = std::fs::File::open("/proc/self/pagemap").ok()?;
+    f.seek(SeekFrom::Start((virt / page_size * 8) as u64)).ok()?;
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf).ok()?;
+    let entry = u64::from_ne_bytes(buf);
+
+    // Bit 63 is "page present"; bits 0..55 hold the page frame number.
+    if entry & (1 << 63) == 0 {
+        return None;
+    }
+    let pfn = entry & ((1 << 55) - 1);
+    if pfn == 0 {
+        return None; // Redacted, we don't have the privileges.
+    }
+    Some(pfn * page_size as u64 + (virt % page_size) as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn virt_to_phys(_virt: usize) -> Option<u64> { None }
+
 pub fn show_cpuid_info() {
     if let Some(brand) = get_cpu_brand() {
         eprintln!("CPU: {}", brand);

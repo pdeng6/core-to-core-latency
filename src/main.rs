@@ -2,6 +2,7 @@ mod bench;
 mod utils;
 
 use bench::Count;
+use bench::cas::SpinMode;
 use std::sync::Arc;
 use clap::Parser;
 use quanta::Clock;
@@ -35,6 +36,26 @@ pub struct CliArgs {
     /// Specify the cores by id that should be used, comma delimited. By default all cores are used.
     #[clap(short, long, require_delimiter=true, value_delimiter=',', value_parser)]
     cores: Vec<usize>,
+
+    /// Bench 1 only: how the waiting thread spins. {n}
+    /// bare: retry the CAS itself (upstream behavior). {n}
+    /// ttas: test-and-test-and-set, spin on a relaxed load first, then CAS.
+    #[clap(long, arg_enum, default_value_t = SpinMode::Bare, value_parser)]
+    spin: SpinMode,
+
+    /// Bench 1 only: which cache line to hold the shared flag, comma delimited,
+    /// one slot per 64-byte line. Which line the flag lives on can affect the
+    /// result, so the slot is a variable in its own right. Pass a list to sweep
+    /// in one run, e.g. --slot 0,1,2 -- only slots measured within a single run
+    /// are comparable, since each process gets different physical pages. Repeat a
+    /// slot to gauge the noise floor: --slot 0,1,0,1
+    ///
+    /// Distinct slots are not guaranteed to behave differently. Virtual adjacency
+    /// also stops implying physical adjacency at every page boundary, and since
+    /// the allocation is not page-aligned, the printed addresses are the only way
+    /// to tell where those boundaries fall.
+    #[clap(long, require_delimiter=true, value_delimiter=',', default_value="0", value_parser)]
+    slot: Vec<usize>,
 }
 
 fn main() {
@@ -63,23 +84,37 @@ fn main() {
     for b in &args.bench {
         match b {
             1 => {
-                eprintln!();
-                eprintln!("1) CAS latency on a single shared cache line");
-                eprintln!();
-                run_bench(&cores, &clock, &args, bench::cas::Bench::new());
+                // One instance for all slots: switching slots must be the only
+                // thing that changes between the sub-runs.
+                let cas = bench::cas::Bench::new(args.spin);
+                for slot in &args.slot {
+                    cas.set_slot(*slot);
+                    let addr = cas.flag_addr() as usize;
+                    let phys = match utils::virt_to_phys(addr) {
+                        Some(p) => format!("{:#x}", p),
+                        None => "unavailable (needs root)".to_string(),
+                    };
+                    eprintln!();
+                    eprintln!("1) CAS latency on a single shared cache line \
+                               [spin={} slot={}/{} virt={:#x} phys={}]",
+                              args.spin, slot % bench::cas::Bench::num_slots(),
+                              bench::cas::Bench::num_slots(), addr, phys);
+                    eprintln!();
+                    run_bench(&cores, &clock, &args, &cas);
+                }
             }
             2 => {
                 eprintln!();
                 eprintln!("2) Single-writer single-reader latency on two shared cache lines");
                 eprintln!();
-                run_bench(&cores, &clock, &args, bench::read_write::Bench::new());
+                run_bench(&cores, &clock, &args, &bench::read_write::Bench::new());
             }
             3 => {
                 utils::assert_rdtsc_usable(&clock);
                 eprintln!();
                 eprintln!("3) Message passing. One writer and one reader on many cache line");
                 eprintln!();
-                run_bench(&cores, &clock, &args, bench::msg_passing::Bench::new(args.num_iterations));
+                run_bench(&cores, &clock, &args, &bench::msg_passing::Bench::new(args.num_iterations));
             }
             _ => panic!("--bench should be 1, 2 or 3"),
         }
