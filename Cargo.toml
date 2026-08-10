@@ -19,3 +19,9 @@ ordered-float = "3"
 cache-padded = "1.2"
 crossbeam-utils = { version = "0.8", default-features = false }
 raw-cpuid = "10"
+
+# For sysconf(_SC_PAGESIZE), needed to index /proc/self/pagemap when resolving a
+# slot's physical address. std exposes no page size, and the pagemap seek offset
+# is wrong without it. Linux-only, as pagemap is the only user.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

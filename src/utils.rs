@@ -68,7 +68,15 @@ pub fn get_cpu_brand() -> Option<String> {
 pub fn virt_to_phys(virt: usize) -> Option<u64> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let page_size = 4096;
+    // pagemap has one 8-byte entry per system page, so the seek offset is only
+    // right if this is the real page size: assuming 4096 on a host with larger
+    // pages reads some other page's entry and silently reports the wrong frame.
+    // Hence the libc dependency, which exists solely for this call -- there is no
+    // page size in std. sysconf is documented not to fail for _SC_PAGESIZE, but
+    // it returns a signed value, so treat anything non-positive as unusable.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = if page_size > 0 { page_size as usize } else { return None };
+
     let mut f = std::fs::File::open("/proc/self/pagemap").ok()?;
     f.seek(SeekFrom::Start((virt / page_size * 8) as u64)).ok()?;
     let mut buf = [0u8; 8];

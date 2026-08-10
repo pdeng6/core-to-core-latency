@@ -17,10 +17,24 @@ const PONG: bool = true;
 /// only one slot is ever touched, and nothing else lives in this allocation.
 const LINE_BYTES: usize = 64;
 
-/// How many lines we allocate to pick the shared flag from. 1024 lines is 64KiB,
-/// i.e. 16 pages -- enough that both the within-page and the page-crossing
-/// address bits vary.
-const NUM_LINES: usize = 1024;
+/// Lines are grouped into page-aligned pages so that slot numbering lines up with
+/// the physical layout: slot N is line N%64 of page N/64, and a page boundary
+/// falls exactly between slot 63 and 64. Without the alignment the allocation
+/// starts partway into a page, putting the boundaries at arbitrary slots.
+const PAGE_BYTES: usize = 4096;
+const LINES_PER_PAGE: usize = PAGE_BYTES / LINE_BYTES;
+
+/// How many pages to allocate. Slots span 16 pages, so both the offset within a
+/// page and the page itself vary across a sweep.
+///
+/// At 64KiB the allocation is also far below the 2MiB a transparent hugepage
+/// covers, so THP does not kick in and every page keeps its own frame -- which
+/// is what spreads the slots across physical memory. Verified by reading back
+/// the frames on a host with THP set to `always`: all 16 pages landed in
+/// distinct 2MiB frames, none of them consecutive, identical with and without
+/// MADV_NOHUGEPAGE. Growing this past 2MiB would forfeit that.
+const NUM_PAGES: usize = 16;
+const NUM_LINES: usize = NUM_PAGES * LINES_PER_PAGE;
 
 /// One cache line of storage, holding the flag in its first byte.
 #[repr(align(64))]
@@ -28,6 +42,23 @@ struct Line {
     flag: AtomicBool,
     _pad: [u8; LINE_BYTES - 1],
 }
+
+/// A page's worth of lines. `Vec` allocates at the element's alignment, so a
+/// `Vec<Page>` is page-aligned without any unsafe code.
+///
+/// `repr(align(..))` takes a literal, so the 4096 here cannot be written in terms
+/// of PAGE_BYTES; the assertions below tie them together instead.
+#[repr(align(4096))]
+struct Page {
+    lines: [Line; LINES_PER_PAGE],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<Line>() == LINE_BYTES);
+    assert!(std::mem::align_of::<Line>() == LINE_BYTES);
+    assert!(std::mem::size_of::<Page>() == PAGE_BYTES);
+    assert!(std::mem::align_of::<Page>() == PAGE_BYTES);
+};
 
 /// How the waiting thread spins.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ArgEnum)]
@@ -54,18 +85,25 @@ impl fmt::Display for SpinMode {
 
 pub struct Bench {
     barrier: Barrier,
-    lines: Vec<Line>,
+    pages: Vec<Page>,
     slot: AtomicUsize,
     spin: SpinMode,
 }
 
 impl Bench {
     pub fn new(spin: SpinMode) -> Self {
+        let new_page = || Page {
+            lines: std::array::from_fn(|_| Line {
+                flag: AtomicBool::new(PING),
+                _pad: [0; LINE_BYTES - 1],
+            }),
+        };
+        // Nothing needed here to keep THP out of the way; see NUM_PAGES.
+        let pages: Vec<Page> = (0..NUM_PAGES).map(|_| new_page()).collect();
+
         Self {
             barrier: Barrier::new(2),
-            lines: (0..NUM_LINES)
-                .map(|_| Line { flag: AtomicBool::new(PING), _pad: [0; LINE_BYTES - 1] })
-                .collect(),
+            pages,
             slot: AtomicUsize::new(0),
             spin,
         }
@@ -79,7 +117,8 @@ impl Bench {
     pub fn num_slots() -> usize { NUM_LINES }
 
     fn flag(&self) -> &AtomicBool {
-        &self.lines[self.slot.load(Ordering::Relaxed)].flag
+        let slot = self.slot.load(Ordering::Relaxed);
+        &self.pages[slot / LINES_PER_PAGE].lines[slot % LINES_PER_PAGE].flag
     }
 
     pub fn flag_addr(&self) -> *const AtomicBool {
