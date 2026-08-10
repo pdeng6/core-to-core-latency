@@ -50,10 +50,10 @@ pub struct CliArgs {
     /// are comparable, since each process gets different physical pages. Repeat a
     /// slot to gauge the noise floor: --slot 0,1,0,1
     ///
-    /// Distinct slots are not guaranteed to behave differently. Virtual adjacency
-    /// also stops implying physical adjacency at every page boundary, and since
-    /// the allocation is not page-aligned, the printed addresses are the only way
-    /// to tell where those boundaries fall.
+    /// Distinct slots are not guaranteed to behave differently. Slots are page
+    /// aligned, so slot N is line N%64 of page N/64, but virtual adjacency stops
+    /// implying physical adjacency at each of those page boundaries: 0..63 vary
+    /// only the offset within one page, while 0,64,128,... land on unrelated pages.
     #[clap(long, require_delimiter=true, value_delimiter=',', default_value="0", value_parser)]
     slot: Vec<usize>,
 }
