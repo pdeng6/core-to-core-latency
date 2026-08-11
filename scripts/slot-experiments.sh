@@ -1,35 +1,50 @@
 #!/bin/bash
 # Slot-placement experiments for bench 1.
 #
-# Three steps, each answering one question:
-#   1. Is one page enough, or do we need all 16?   (1024 slots, one pass)
-#   2. Is the per-slot value stable across repeats? (page 0 x N)
-#   3. Does the answer hold when each measurement   (page 0 x N, longer)
-#      runs much longer?
+# Usage:
+#   sudo ./slot-experiments.sh                     # run all 4 steps
+#   sudo STEPS=4 ./slot-experiments.sh             # run step 4 only
+#   sudo STEPS=1,2 ./slot-experiments.sh           # run steps 1 and 2
+#   sudo STEPS=4 PAUSE_LIST=5,6,7 ./slot-experiments.sh  # step 4 with specific pause values
+#   DRY_RUN=1 ./slot-experiments.sh                # just show plan, don't run
 #
-# Steps 1 and 2 use the customer's settings (`core-to-core-latency 5000 -b 1` is
-# 5000 iterations x the default 300 samples). Step 3 raises only the iteration
-# count, so it is the same experiment as step 2 with each measurement running 4x
-# longer -- if the two agree, run length is not influencing the result.
+# Steps:
+#   1  Is one page enough, or do we need all 16?   (1024 slots, one pass)
+#   2  Is the per-slot value stable across repeats? (page 0 x N repeats)
+#   3  Does the answer hold with longer measurements? (page 0 x N, 4x iter)
+#   4  How does PAUSE after CAS affect the distribution? (page 0 x N, sweep)
+#      If PAUSE_LIST is set (e.g. "1,2,3"), runs exactly those pause values.
+#      Otherwise, auto-calibrates: measures PAUSE latency, runs a quick baseline,
+#      and sweeps pause=1..floor(baseline_mean / pause_ns).
 #
-# Step 1 decides whether steps 2/3 may restrict themselves to one page. The
-# judgement is whether every page COVERS THE SAME RANGE, not whether the pages
-# agree slot-by-slot -- they do not, because the value follows the full physical
-# address, so the same slot number means a different line in each page.
+# Environment variables:
+#   STEPS         which steps to run, comma-separated (default: 1,2,3,4)
+#   CORES         core pair to test (default: 2,7)
+#   MEMNODE       NUMA node for memory binding (default: 0)
+#   OUTDIR        output directory (default: /tmp/slot-exp-YYYYMMDD-HHMMSS)
+#   PAUSE_LIST    step 4: explicit list of pause counts (e.g. "1,2,3,4,5")
+#   BIN           path to the benchmark binary
+#   MEASURE_PAUSE path to the measure-pause binary
+#   BASE_ITER     iterations for steps 1,2,4 (default: 5000)
+#   BASE_SAMPLES  samples for steps 1,2,4 (default: 300)
+#   LONG_ITER     iterations for step 3 (default: 20000)
+#   LONG_SAMPLES  samples for step 3 (default: 300)
+#   REPS2         repeats for step 2 (default: 5)
+#   REPS3         repeats for steps 3,4 (default: 5)
+#   DRY_RUN       set to 1 to only print the plan
 #
-# Memory is bound to the local node throughout. Without that, the page can land
-# on a remote node and the placement effect we are trying to measure is swamped
-# by a much larger NUMA effect. Thread placement is left to the benchmark, which
-# sets affinity itself -- do not add --cpunodebind, it only conflicts with that.
-#
-# Repeats are interleaved (0..63, 0..63, ...) rather than grouped (0,0,..,1,1,..)
-# so that slow drift shows up as a difference between repeats instead of being
-# absorbed into the per-slot spread.
-#
-# Core and uncore frequencies are sampled while each step runs, not before it.
-# The PCU only raises the uncore clock when it sees mesh traffic, so an idle
-# reading says nothing about what the measurement actually ran at, and reading
-# current_freq_khz requires root.
+# Notes:
+#   - Memory is bound to the local node to avoid NUMA placement noise.
+#   - Core and uncore frequencies are pinned on entry and restored on exit.
+#   - Repeats are interleaved (0..63, 0..63, ...) not grouped, so time drift
+#     shows as a difference between repeats rather than being absorbed.
+#   - Each step is self-contained: no step depends on another's output.
+#   - Run as root for physical address reporting and frequency pinning.
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    sed -n '2,/^[^#]/{ /^#/s/^# \?//p }' "$0"
+    exit 0
+fi
 
 set -u
 
@@ -37,6 +52,17 @@ BIN=${BIN:-./target/release/core-to-core-latency}
 CORES=${CORES:-2,7}
 MEMNODE=${MEMNODE:-0}
 OUTDIR=${OUTDIR:-/tmp/slot-exp-$(date +%Y%m%d-%H%M%S)}
+
+# Which steps to run: comma-separated, e.g. STEPS=1,2,3,4 (default: all).
+STEPS=${STEPS:-1,2,3,4}
+run_step_enabled() { echo ",$STEPS," | grep -q ",$1,"; }
+
+# Step 4: explicit pause values to sweep. If set, skips auto-calibration.
+# e.g. PAUSE_LIST=1,2,3,4,5 or PAUSE_LIST=5,6,7,8,9 for a targeted re-run.
+PAUSE_LIST=${PAUSE_LIST:-}
+
+# Path to the measure-pause binary (used by step 4 to calibrate PAUSE latency).
+MEASURE_PAUSE=${MEASURE_PAUSE:-$(dirname "$BIN")/../../scripts/measure-pause}
 
 # Steps 1-2: the customer's settings. Step 3: 4x the iterations per sample.
 BASE_ITER=${BASE_ITER:-5000}
@@ -73,18 +99,19 @@ fmt() { awk -v s="$1" 'BEGIN{ printf "%dm%02ds", s/60, s%60 }'; }
 E1=$(est_secs "$BASE_ITER" "$BASE_SAMPLES" "$NUM_SLOTS")
 E2=$(est_secs "$BASE_ITER" "$BASE_SAMPLES" $((LINES_PER_PAGE * REPS2)))
 E3=$(est_secs "$LONG_ITER" "$LONG_SAMPLES" $((LINES_PER_PAGE * REPS3)))
-E4=$(est_secs "$BASE_ITER" "$BASE_SAMPLES" $((LINES_PER_PAGE * REPS3 * 4)))
+# Step 4 estimate is approximate -- actual count depends on measured pause latency.
+E4_APPROX=$(est_secs "$BASE_ITER" "$BASE_SAMPLES" $((LINES_PER_PAGE * REPS3 * 8)))
 
 print_plan() {
 cat <<EOF
-cores=$CORES  membind=$MEMNODE  outdir=$OUTDIR
+cores=$CORES  membind=$MEMNODE  outdir=$OUTDIR  steps=$STEPS
 
   step  what                            measurements  settings       est
   1     all $NUM_SLOTS slots, one pass           $NUM_SLOTS         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E1")
   2     page 0 x $REPS2 repeats                     $((LINES_PER_PAGE * REPS2))         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E2")
   3     page 0 x $REPS3 repeats, longer             $((LINES_PER_PAGE * REPS3))         ${LONG_ITER}x${LONG_SAMPLES}    $(fmt "$E3")
-  4     page 0 x $REPS3, pause=1,2,3,4        $((LINES_PER_PAGE * REPS3 * 4))         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E4")
-                                                            total  $(fmt $((E1 + E2 + E3 + E4)))
+  4     page 0 x $REPS3, pause=1..N            ~N*$((LINES_PER_PAGE * REPS3))         ${BASE_ITER}x${BASE_SAMPLES}     ~$(fmt "$E4_APPROX")
+        (N = baseline_mean / pause_ns, auto-calibrated)
 
 EOF
 }
@@ -490,6 +517,7 @@ run_step() { # name iter samples slotlist [pause]
 pre_run_freq_check
 
 # --- step 1: does one page stand in for all 16? -----------------------------
+if run_step_enabled 1; then
 run_step step1-allslots "$BASE_ITER" "$BASE_SAMPLES" "$(seq -s, 0 $((NUM_SLOTS - 1)))" || exit 1
 append_stats step1-allslots "$BASE_ITER" "$BASE_SAMPLES" 1 "$OUTDIR/step1-allslots.tsv"
 
@@ -576,6 +604,8 @@ awk -v lpp=$LINES_PER_PAGE -v npg=$((NUM_SLOTS / LINES_PER_PAGE)) "$STDDEV_AWK"'
         printf "     does not fix the latency: the page it sits in matters too.\n"
     }' "$OUTDIR/step1-allslots.tsv"
 
+fi # step 1
+
 # --- steps 2 and 3: repeat page 0 -------------------------------------------
 page0_x() { local r=$1; for _ in $(seq 1 "$r"); do seq 0 $((LINES_PER_PAGE - 1)); done | paste -sd,; }
 
@@ -629,49 +659,86 @@ analyse_reps() { # name reps
               printf "  -> a trend down this column would be time drift, not placement.\n" }' "$f"
 }
 
+if run_step_enabled 2; then
 run_step step2-page0 "$BASE_ITER" "$BASE_SAMPLES" "$(page0_x "$REPS2")" || exit 1
 append_stats step2-page0 "$BASE_ITER" "$BASE_SAMPLES" "$REPS2" "$OUTDIR/step2-page0.tsv"
 analyse_reps step2-page0 "$REPS2"
+fi # step 2
 
+if run_step_enabled 3; then
 run_step step3-page0-long "$LONG_ITER" "$LONG_SAMPLES" "$(page0_x "$REPS3")" || exit 1
 append_stats step3-page0-long "$LONG_ITER" "$LONG_SAMPLES" "$REPS3" "$OUTDIR/step3-page0-long.tsv"
 analyse_reps step3-page0-long "$REPS3"
+fi # step 3
 
-# --- step 4: same as step 3 but with PAUSE after each successful CAS --------
-# Sweeps --pause 1,2,3,4 to see whether inserting a short delay after flipping
-# the flag changes the distribution. If contention from immediate retries is
-# inflating the measured latency, adding a PAUSE (which holds the line slightly
-# longer) should reduce it; if not, it should add ~N*pause_ns uniformly.
-for pc in 1 2 3 4; do
+# --- step 4: PAUSE sweep after each successful CAS --------------------------
+# If PAUSE_LIST is set, runs exactly those values. Otherwise, auto-calibrates:
+# measures PAUSE latency, runs a quick baseline, sweeps 1..floor(mean/pause_ns).
+if run_step_enabled 4; then
+
+if [ -n "$PAUSE_LIST" ]; then
+    # Explicit list: skip calibration, just run what the user asked for.
+    PAUSE_VALUES=$(echo "$PAUSE_LIST" | tr ',' ' ')
+    echo "step 4: using explicit PAUSE_LIST=$PAUSE_LIST"
+    # Still run a baseline for the summary table
+    echo "step 4: running baseline (page 0, single pass)..."
+    run_step step4-baseline "$BASE_ITER" "$BASE_SAMPLES" "$(seq -s, 0 $((LINES_PER_PAGE - 1)))" || exit 1
+    BASELINE_NS=$(awk '{ s += $2; n++ } END { printf "%.1f", s/n }' "$OUTDIR/step4-baseline.tsv")
+    echo "step 4: baseline mean = ${BASELINE_NS}ns"
+else
+    # Auto-calibrate the sweep range.
+    # 4a. Measure PAUSE latency
+    if [ -x "$MEASURE_PAUSE" ]; then
+        PAUSE_NS=$(${MEASURE_PAUSE} 2>/dev/null | awk '/^ns\/PAUSE:/{print $2}')
+        echo "step 4: measured PAUSE latency = ${PAUSE_NS}ns (from $MEASURE_PAUSE)"
+    else
+        PAUSE_NS=14
+        echo "step 4: measure-pause not found at $MEASURE_PAUSE, using default ${PAUSE_NS}ns"
+    fi
+
+    # 4b. Quick baseline: one page, no repeats, to get the mean c2c latency
+    echo "step 4: running baseline (page 0, single pass)..."
+    run_step step4-baseline "$BASE_ITER" "$BASE_SAMPLES" "$(seq -s, 0 $((LINES_PER_PAGE - 1)))" || exit 1
+    BASELINE_NS=$(awk '{ s += $2; n++ } END { printf "%.1f", s/n }' "$OUTDIR/step4-baseline.tsv")
+    echo "step 4: baseline mean = ${BASELINE_NS}ns"
+
+    # 4c. Compute max pause count: floor(baseline / pause_ns)
+    MAX_PAUSE=$(awk -v base="$BASELINE_NS" -v pns="$PAUSE_NS" 'BEGIN { printf "%d", int(base / pns) }')
+    [ "$MAX_PAUSE" -lt 1 ] && MAX_PAUSE=1
+    PAUSE_VALUES=$(seq 1 "$MAX_PAUSE")
+    echo "step 4: sweeping pause=1..${MAX_PAUSE} (${BASELINE_NS}ns / ${PAUSE_NS}ns)"
+fi
+echo
+
+# 4d. Run the sweep
+for pc in $PAUSE_VALUES; do
     run_step "step4-pause${pc}" "$BASE_ITER" "$BASE_SAMPLES" "$(page0_x "$REPS3")" "$pc" || exit 1
     append_stats "step4-pause${pc}" "$BASE_ITER" "$BASE_SAMPLES" "$REPS3" "$OUTDIR/step4-pause${pc}.tsv"
     analyse_reps "step4-pause${pc}" "$REPS3"
 done
 
 echo
-echo "-- step3 vs step4: effect of PAUSE after CAS --"
+echo "-- step4: effect of PAUSE after CAS --"
 printf "  %-16s %8s %8s %8s %8s %8s\n" "step" "mean" "stddev" "RSD%" "min" "max"
-for f in step3-page0-long step4-pause1 step4-pause2 step4-pause3 step4-pause4; do
-    awk -v name="$f" "$STDDEV_AWK"'
+printf "  %-16s %8.2f %8s %8s %8s %8s\n" "baseline" "$BASELINE_NS" "-" "-" "-" "-"
+for pc in $PAUSE_VALUES; do
+    awk -v name="step4-pause${pc}" "$STDDEV_AWK"'
         { n++; a[n] = $2; s += $2; if (n==1 || $2<mn) mn=$2; if ($2>mx) mx=$2 }
         END { m = s/n; sd = stddev(a, n)
               printf "  %-16s %8.2f %8.2f %8.2f %8.2f %8.2f\n",
-                     name, m, sd, rsd(sd, m), mn, mx }' "$OUTDIR/$f.tsv"
+                     name, m, sd, rsd(sd, m), mn, mx }' "$OUTDIR/step4-pause${pc}.tsv"
 done
 
-echo
-echo "-- step2 vs step3: does the longer run change the distribution? --"
-# Compared as distributions, not slot by slot. Each process gets different
-# physical pages, so slot N is a different line in step 2 than in step 3 and
-# pairing them by slot number is meaningless. What must agree is the shape: if
-# the shorter setting is sufficient, both steps sample the same underlying
-# population of lines and their quantiles land on top of each other.
-#
-# The unit is the per-slot mean -- one value per line, repeats averaged away --
-# so the spread reported here is placement, not measurement noise.
+fi # step 4
+
+# --- distribution comparison (runs if step 2 and 3 both ran) ----------------
 per_slot_means() { # tsv
     awk '{ s[$1] += $2; n[$1]++ } END { for (k in s) printf "%.3f\n", s[k]/n[k] }' "$1" | sort -n
 }
+
+if [ -f "$OUTDIR/step2-page0.tsv" ] && [ -f "$OUTDIR/step3-page0-long.tsv" ]; then
+echo
+echo "-- step2 vs step3: does the longer run change the distribution? --"
 per_slot_means "$OUTDIR/step2-page0.tsv"      > "$OUTDIR/dist-step2.txt"
 per_slot_means "$OUTDIR/step3-page0-long.tsv" > "$OUTDIR/dist-step3.txt"
 
@@ -679,8 +746,6 @@ paste "$OUTDIR/dist-step2.txt" "$OUTDIR/dist-step3.txt" \
   | awk "$STDDEV_AWK"'
     { n++; a[n] = $1; b[n] = $2 }
     END {
-        # Quantiles of each distribution, side by side. Both columns are already
-        # sorted, so index i is the i-th smallest of each -- a Q-Q comparison.
         split("0 10 25 50 75 90 100", q, " ")
         printf "  %-8s %10s %10s %8s\n", "quantile", "step2", "step3", "diff"
         for (i = 1; i <= 7; i++) {
@@ -704,26 +769,34 @@ paste "$OUTDIR/dist-step2.txt" "$OUTDIR/dist-step3.txt" \
         printf "     sufficient, when that gap is small next to the range and the\n"
         printf "     two RSDs match.\n"
     }'
+fi
 
-# Histogram of both, on shared bins, so the shape is visible and not just summarised.
+# --- latency distribution histograms ----------------------------------------
+# Collect all available dist files (step2, step3, and whatever pause values ran).
 echo
 echo "-- latency distribution, all steps (per-slot means, shared 2ns bins) --"
-# Generate dist files for step4 as well
-for pc in 1 2 3 4; do
-    per_slot_means "$OUTDIR/step4-pause${pc}.tsv" > "$OUTDIR/dist-step4-pause${pc}.txt"
-done
 
-ALL_DIST="step2 step3 pause1 pause2 pause3 pause4"
-awk -v dir="$OUTDIR" -v steps="$ALL_DIST" '
+# Generate dist files for all step4 pause runs that produced a tsv
+ALL_DIST_NAMES="step2 step3"
+ALL_DIST_FILES="$OUTDIR/dist-step2.txt $OUTDIR/dist-step3.txt"
+[ -f "$OUTDIR/step2-page0.tsv" ] && per_slot_means "$OUTDIR/step2-page0.tsv" > "$OUTDIR/dist-step2.txt"
+[ -f "$OUTDIR/step3-page0-long.tsv" ] && per_slot_means "$OUTDIR/step3-page0-long.tsv" > "$OUTDIR/dist-step3.txt"
+
+pc=1
+while [ -f "$OUTDIR/step4-pause${pc}.tsv" ]; do
+    per_slot_means "$OUTDIR/step4-pause${pc}.tsv" > "$OUTDIR/dist-step4-pause${pc}.txt"
+    ALL_DIST_NAMES="$ALL_DIST_NAMES p${pc}"
+    ALL_DIST_FILES="$ALL_DIST_FILES $OUTDIR/dist-step4-pause${pc}.txt"
+    pc=$((pc + 1))
+done
+NUM_DIST=$((pc - 1 + 2))  # +2 for step2 and step3
+
+# Numeric table
+awk -v names="$ALL_DIST_NAMES" -v flist="$ALL_DIST_FILES" '
     BEGIN {
         bin = 2
-        n = split(steps, names, " ")
-        files[1] = dir "/dist-step2.txt"
-        files[2] = dir "/dist-step3.txt"
-        files[3] = dir "/dist-step4-pause1.txt"
-        files[4] = dir "/dist-step4-pause2.txt"
-        files[5] = dir "/dist-step4-pause3.txt"
-        files[6] = dir "/dist-step4-pause4.txt"
+        n = split(names, nm, " ")
+        split(flist, files, " ")
         for (i = 1; i <= n; i++) {
             while ((getline v < files[i]) > 0) {
                 h[i, int(v/bin)]++
@@ -732,33 +805,29 @@ awk -v dir="$OUTDIR" -v steps="$ALL_DIST" '
             }
             close(files[i])
         }
-        printf "  %-10s", "bin (ns)"
-        for (i = 1; i <= n; i++) printf " %-6s", names[i]
+        printf "  %-9s", "bin(ns)"
+        for (i = 1; i <= n; i++) printf " %5s", nm[i]
         print ""
         for (b = int(lo/bin); b <= int(hi/bin); b++) {
             any = 0
             for (i = 1; i <= n; i++) if (h[i,b]+0 > 0) any = 1
             if (!any) continue
-            printf "  %4.0f-%-5.0f", b*bin, (b+1)*bin
-            for (i = 1; i <= n; i++) printf " %3d   ", h[i,b]+0
+            printf "  %3.0f-%-5.0f", b*bin, (b+1)*bin
+            for (i = 1; i <= n; i++) printf " %5d", h[i,b]+0
             printf "\n"
         }
         printf "\n  -> the pause columns should shift right (higher latency) while\n"
         printf "     maintaining a similar shape if the effect is purely additive.\n"
     }' /dev/null
 
+# Bar chart (scaled: each # = ceil(count/scale))
 echo
-echo "-- latency distribution, bar chart (per-slot means, shared 2ns bins) --"
-awk -v dir="$OUTDIR" -v steps="$ALL_DIST" '
+echo "-- latency distribution, bar chart (2ns bins, each # = ~3 slots) --"
+awk -v names="$ALL_DIST_NAMES" -v flist="$ALL_DIST_FILES" '
     BEGIN {
-        bin = 2
-        n = split(steps, names, " ")
-        files[1] = dir "/dist-step2.txt"
-        files[2] = dir "/dist-step3.txt"
-        files[3] = dir "/dist-step4-pause1.txt"
-        files[4] = dir "/dist-step4-pause2.txt"
-        files[5] = dir "/dist-step4-pause3.txt"
-        files[6] = dir "/dist-step4-pause4.txt"
+        bin = 2; scale = 3
+        n = split(names, nm, " ")
+        split(flist, files, " ")
         for (i = 1; i <= n; i++) {
             while ((getline v < files[i]) > 0) {
                 h[i, int(v/bin)]++
@@ -767,18 +836,19 @@ awk -v dir="$OUTDIR" -v steps="$ALL_DIST" '
             }
             close(files[i])
         }
-        printf "  %-10s", "bin (ns)"
-        for (i = 1; i <= n; i++) printf " %-18s", names[i]
+        printf "  %-9s", "bin(ns)"
+        for (i = 1; i <= n; i++) printf " %-13s", nm[i]
         print ""
         for (b = int(lo/bin); b <= int(hi/bin); b++) {
             any = 0
             for (i = 1; i <= n; i++) if (h[i,b]+0 > 0) any = 1
             if (!any) continue
-            printf "  %4.0f-%-5.0f", b*bin, (b+1)*bin
+            printf "  %3.0f-%-5.0f", b*bin, (b+1)*bin
             for (i = 1; i <= n; i++) {
                 bar = ""
-                for (j = 0; j < h[i,b]+0; j++) bar = bar "#"
-                printf " %-18s", bar
+                cnt = int((h[i,b]+0+scale-1)/scale)
+                for (j = 0; j < cnt; j++) bar = bar "#"
+                printf " %-13s", bar
             }
             printf "\n"
         }
@@ -796,5 +866,4 @@ echo "  config.log       cpu, frequency policy, uncore limits, THP, NUMA, load"
 echo "  <step>.out       raw benchmark output"
 echo "  <step>.tsv       slot, latency, internal error, physical address"
 echo "  <step>.freq.log  uncore MHz sampled during that step"
-echo "  <step>.turbostat.log  core MHz sampled during that step"
 echo "  dist-*.txt            per-slot means, sorted, for distribution comparisons"
