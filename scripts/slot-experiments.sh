@@ -73,7 +73,7 @@ fmt() { awk -v s="$1" 'BEGIN{ printf "%dm%02ds", s/60, s%60 }'; }
 E1=$(est_secs "$BASE_ITER" "$BASE_SAMPLES" "$NUM_SLOTS")
 E2=$(est_secs "$BASE_ITER" "$BASE_SAMPLES" $((LINES_PER_PAGE * REPS2)))
 E3=$(est_secs "$LONG_ITER" "$LONG_SAMPLES" $((LINES_PER_PAGE * REPS3)))
-E4=$(est_secs "$LONG_ITER" "$LONG_SAMPLES" $((LINES_PER_PAGE * REPS3 * 4)))
+E4=$(est_secs "$BASE_ITER" "$BASE_SAMPLES" $((LINES_PER_PAGE * REPS3 * 4)))
 
 print_plan() {
 cat <<EOF
@@ -83,7 +83,7 @@ cores=$CORES  membind=$MEMNODE  outdir=$OUTDIR
   1     all $NUM_SLOTS slots, one pass           $NUM_SLOTS         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E1")
   2     page 0 x $REPS2 repeats                     $((LINES_PER_PAGE * REPS2))         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E2")
   3     page 0 x $REPS3 repeats, longer             $((LINES_PER_PAGE * REPS3))         ${LONG_ITER}x${LONG_SAMPLES}    $(fmt "$E3")
-  4     page 0 x $REPS3, pause=1,2,3,4        $((LINES_PER_PAGE * REPS3 * 4))         ${LONG_ITER}x${LONG_SAMPLES}    $(fmt "$E4")
+  4     page 0 x $REPS3, pause=1,2,3,4        $((LINES_PER_PAGE * REPS3 * 4))         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E4")
                                                             total  $(fmt $((E1 + E2 + E3 + E4)))
 
 EOF
@@ -643,8 +643,8 @@ analyse_reps step3-page0-long "$REPS3"
 # inflating the measured latency, adding a PAUSE (which holds the line slightly
 # longer) should reduce it; if not, it should add ~N*pause_ns uniformly.
 for pc in 1 2 3 4; do
-    run_step "step4-pause${pc}" "$LONG_ITER" "$LONG_SAMPLES" "$(page0_x "$REPS3")" "$pc" || exit 1
-    append_stats "step4-pause${pc}" "$LONG_ITER" "$LONG_SAMPLES" "$REPS3" "$OUTDIR/step4-pause${pc}.tsv"
+    run_step "step4-pause${pc}" "$BASE_ITER" "$BASE_SAMPLES" "$(page0_x "$REPS3")" "$pc" || exit 1
+    append_stats "step4-pause${pc}" "$BASE_ITER" "$BASE_SAMPLES" "$REPS3" "$OUTDIR/step4-pause${pc}.tsv"
     analyse_reps "step4-pause${pc}" "$REPS3"
 done
 
@@ -707,22 +707,82 @@ paste "$OUTDIR/dist-step2.txt" "$OUTDIR/dist-step3.txt" \
 
 # Histogram of both, on shared bins, so the shape is visible and not just summarised.
 echo
-echo "-- latency distribution, page 0 (per-slot means, shared 2ns bins) --"
-cat "$OUTDIR/dist-step2.txt" "$OUTDIR/dist-step3.txt" \
-  | awk -v f2="$OUTDIR/dist-step2.txt" -v f3="$OUTDIR/dist-step3.txt" '
-    BEGIN { bin = 2
-            while ((getline v < f2) > 0) { h2[int(v/bin)]++; if (!lo || v<lo) lo=v; if (v>hi) hi=v }
-            while ((getline v < f3) > 0) { h3[int(v/bin)]++; if (!lo || v<lo) lo=v; if (v>hi) hi=v }
-            printf "  %-14s %-24s %-24s\n", "bin (ns)", "step2", "step3"
-            for (b = int(lo/bin); b <= int(hi/bin); b++) {
-                bar2 = ""; bar3 = ""
-                for (i = 0; i < h2[b]; i++) bar2 = bar2 "#"
-                for (i = 0; i < h3[b]; i++) bar3 = bar3 "#"
-                printf "  %5.0f-%-8.0f %-3d %-20s %-3d %-20s\n",
-                       b*bin, (b+1)*bin, h2[b]+0, bar2, h3[b]+0, bar3
+echo "-- latency distribution, all steps (per-slot means, shared 2ns bins) --"
+# Generate dist files for step4 as well
+for pc in 1 2 3 4; do
+    per_slot_means "$OUTDIR/step4-pause${pc}.tsv" > "$OUTDIR/dist-step4-pause${pc}.txt"
+done
+
+ALL_DIST="step2 step3 pause1 pause2 pause3 pause4"
+awk -v dir="$OUTDIR" -v steps="$ALL_DIST" '
+    BEGIN {
+        bin = 2
+        n = split(steps, names, " ")
+        files[1] = dir "/dist-step2.txt"
+        files[2] = dir "/dist-step3.txt"
+        files[3] = dir "/dist-step4-pause1.txt"
+        files[4] = dir "/dist-step4-pause2.txt"
+        files[5] = dir "/dist-step4-pause3.txt"
+        files[6] = dir "/dist-step4-pause4.txt"
+        for (i = 1; i <= n; i++) {
+            while ((getline v < files[i]) > 0) {
+                h[i, int(v/bin)]++
+                if (!lo || v < lo) lo = v
+                if (v > hi) hi = v
             }
-            printf "\n  -> distinct clusters here are distinct placements; a single broad\n"
-            printf "     smear would instead point at measurement noise.\n" }' /dev/null
+            close(files[i])
+        }
+        printf "  %-10s", "bin (ns)"
+        for (i = 1; i <= n; i++) printf " %-6s", names[i]
+        print ""
+        for (b = int(lo/bin); b <= int(hi/bin); b++) {
+            any = 0
+            for (i = 1; i <= n; i++) if (h[i,b]+0 > 0) any = 1
+            if (!any) continue
+            printf "  %4.0f-%-5.0f", b*bin, (b+1)*bin
+            for (i = 1; i <= n; i++) printf " %3d   ", h[i,b]+0
+            printf "\n"
+        }
+        printf "\n  -> the pause columns should shift right (higher latency) while\n"
+        printf "     maintaining a similar shape if the effect is purely additive.\n"
+    }' /dev/null
+
+echo
+echo "-- latency distribution, bar chart (per-slot means, shared 2ns bins) --"
+awk -v dir="$OUTDIR" -v steps="$ALL_DIST" '
+    BEGIN {
+        bin = 2
+        n = split(steps, names, " ")
+        files[1] = dir "/dist-step2.txt"
+        files[2] = dir "/dist-step3.txt"
+        files[3] = dir "/dist-step4-pause1.txt"
+        files[4] = dir "/dist-step4-pause2.txt"
+        files[5] = dir "/dist-step4-pause3.txt"
+        files[6] = dir "/dist-step4-pause4.txt"
+        for (i = 1; i <= n; i++) {
+            while ((getline v < files[i]) > 0) {
+                h[i, int(v/bin)]++
+                if (!lo || v < lo) lo = v
+                if (v > hi) hi = v
+            }
+            close(files[i])
+        }
+        printf "  %-10s", "bin (ns)"
+        for (i = 1; i <= n; i++) printf " %-18s", names[i]
+        print ""
+        for (b = int(lo/bin); b <= int(hi/bin); b++) {
+            any = 0
+            for (i = 1; i <= n; i++) if (h[i,b]+0 > 0) any = 1
+            if (!any) continue
+            printf "  %4.0f-%-5.0f", b*bin, (b+1)*bin
+            for (i = 1; i <= n; i++) {
+                bar = ""
+                for (j = 0; j < h[i,b]+0; j++) bar = bar "#"
+                printf " %-18s", bar
+            }
+            printf "\n"
+        }
+    }' /dev/null
 
 echo
 echo "-- headline numbers (also in stats.csv) --"
@@ -737,4 +797,4 @@ echo "  <step>.out       raw benchmark output"
 echo "  <step>.tsv       slot, latency, internal error, physical address"
 echo "  <step>.freq.log  uncore MHz sampled during that step"
 echo "  <step>.turbostat.log  core MHz sampled during that step"
-echo "  dist-step[23].txt     per-slot means, sorted, as fed to the comparison"
+echo "  dist-*.txt            per-slot means, sorted, for distribution comparisons"
