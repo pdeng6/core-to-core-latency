@@ -73,16 +73,18 @@ fmt() { awk -v s="$1" 'BEGIN{ printf "%dm%02ds", s/60, s%60 }'; }
 E1=$(est_secs "$BASE_ITER" "$BASE_SAMPLES" "$NUM_SLOTS")
 E2=$(est_secs "$BASE_ITER" "$BASE_SAMPLES" $((LINES_PER_PAGE * REPS2)))
 E3=$(est_secs "$LONG_ITER" "$LONG_SAMPLES" $((LINES_PER_PAGE * REPS3)))
+E4=$(est_secs "$LONG_ITER" "$LONG_SAMPLES" $((LINES_PER_PAGE * REPS3 * 4)))
 
 print_plan() {
 cat <<EOF
 cores=$CORES  membind=$MEMNODE  outdir=$OUTDIR
 
-  step  what                        measurements  settings       est
-  1     all $NUM_SLOTS slots, one pass       $NUM_SLOTS         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E1")
-  2     page 0 x $REPS2 repeats                 $((LINES_PER_PAGE * REPS2))         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E2")
-  3     page 0 x $REPS3 repeats, longer         $((LINES_PER_PAGE * REPS3))         ${LONG_ITER}x${LONG_SAMPLES}    $(fmt "$E3")
-                                                        total  $(fmt $((E1 + E2 + E3)))
+  step  what                            measurements  settings       est
+  1     all $NUM_SLOTS slots, one pass           $NUM_SLOTS         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E1")
+  2     page 0 x $REPS2 repeats                     $((LINES_PER_PAGE * REPS2))         ${BASE_ITER}x${BASE_SAMPLES}     $(fmt "$E2")
+  3     page 0 x $REPS3 repeats, longer             $((LINES_PER_PAGE * REPS3))         ${LONG_ITER}x${LONG_SAMPLES}    $(fmt "$E3")
+  4     page 0 x $REPS3, pause=1,2,3,4        $((LINES_PER_PAGE * REPS3 * 4))         ${LONG_ITER}x${LONG_SAMPLES}    $(fmt "$E4")
+                                                            total  $(fmt $((E1 + E2 + E3 + E4)))
 
 EOF
 }
@@ -451,8 +453,8 @@ summarise() { # file column label
                      lbl, n, m, sd, rsd(sd, m), mn, mx }' "$1"
 }
 
-run_step() { # name iter samples slotlist
-    local name=$1 iter=$2 samples=$3 slots=$4
+run_step() { # name iter samples slotlist [pause]
+    local name=$1 iter=$2 samples=$3 slots=$4 pause=${5:-0}
     local out="$OUTDIR/$name.out"
     # Warmups are measured and then discarded, so they cost time but keep the
     # first real slot from absorbing the process's cold start.
@@ -460,11 +462,13 @@ run_step() { # name iter samples slotlist
     if [ "$WARMUP" -gt 0 ]; then
         warm="$(for _ in $(seq 1 "$WARMUP"); do echo 0; done | paste -sd,),"
     fi
-    echo "== $name: $iter x $samples (+$WARMUP warmup) =="
+    local pause_label=""
+    [ "$pause" -gt 0 ] && pause_label=" pause=$pause"
+    echo "== $name: $iter x $samples${pause_label} (+$WARMUP warmup) =="
     local t0=$SECONDS
     start_freq_sampler "$name"
     numactl --membind="$MEMNODE" "$BIN" "$iter" "$samples" -b 1 \
-            --cores "$CORES" --slot "${warm}${slots}" > "$out" 2>&1
+            --cores "$CORES" --slot "${warm}${slots}" --pause "$pause" > "$out" 2>&1
     local rc=$?
     stop_freq_sampler "$name"
     echo "   $((SECONDS - t0))s, rc=$rc -> $out"
@@ -632,6 +636,28 @@ analyse_reps step2-page0 "$REPS2"
 run_step step3-page0-long "$LONG_ITER" "$LONG_SAMPLES" "$(page0_x "$REPS3")" || exit 1
 append_stats step3-page0-long "$LONG_ITER" "$LONG_SAMPLES" "$REPS3" "$OUTDIR/step3-page0-long.tsv"
 analyse_reps step3-page0-long "$REPS3"
+
+# --- step 4: same as step 3 but with PAUSE after each successful CAS --------
+# Sweeps --pause 1,2,3,4 to see whether inserting a short delay after flipping
+# the flag changes the distribution. If contention from immediate retries is
+# inflating the measured latency, adding a PAUSE (which holds the line slightly
+# longer) should reduce it; if not, it should add ~N*pause_ns uniformly.
+for pc in 1 2 3 4; do
+    run_step "step4-pause${pc}" "$LONG_ITER" "$LONG_SAMPLES" "$(page0_x "$REPS3")" "$pc" || exit 1
+    append_stats "step4-pause${pc}" "$LONG_ITER" "$LONG_SAMPLES" "$REPS3" "$OUTDIR/step4-pause${pc}.tsv"
+    analyse_reps "step4-pause${pc}" "$REPS3"
+done
+
+echo
+echo "-- step3 vs step4: effect of PAUSE after CAS --"
+printf "  %-16s %8s %8s %8s %8s %8s\n" "step" "mean" "stddev" "RSD%" "min" "max"
+for f in step3-page0-long step4-pause1 step4-pause2 step4-pause3 step4-pause4; do
+    awk -v name="$f" "$STDDEV_AWK"'
+        { n++; a[n] = $2; s += $2; if (n==1 || $2<mn) mn=$2; if ($2>mx) mx=$2 }
+        END { m = s/n; sd = stddev(a, n)
+              printf "  %-16s %8.2f %8.2f %8.2f %8.2f %8.2f\n",
+                     name, m, sd, rsd(sd, m), mn, mx }' "$OUTDIR/$f.tsv"
+done
 
 echo
 echo "-- step2 vs step3: does the longer run change the distribution? --"
