@@ -88,10 +88,11 @@ pub struct Bench {
     pages: Vec<Page>,
     slot: AtomicUsize,
     spin: SpinMode,
+    pause_count: u32,
 }
 
 impl Bench {
-    pub fn new(spin: SpinMode) -> Self {
+    pub fn new(spin: SpinMode, pause_count: u32) -> Self {
         let new_page = || Page {
             lines: std::array::from_fn(|_| Line {
                 flag: AtomicBool::new(PING),
@@ -106,6 +107,7 @@ impl Bench {
             pages,
             slot: AtomicUsize::new(0),
             spin,
+            pause_count,
         }
     }
 
@@ -126,12 +128,20 @@ impl Bench {
     }
 }
 
+#[inline(always)]
+fn do_pause(n: u32) {
+    for _ in 0..n {
+        unsafe { std::arch::x86_64::_mm_pause() };
+    }
+}
+
 /// Spin on a load before attempting the CAS. See [`SpinMode::Ttas`].
 #[inline(always)]
-fn ttas_cas(flag: &AtomicBool, expected: bool) {
+fn ttas_cas(flag: &AtomicBool, expected: bool, pause_count: u32) {
     loop {
         while flag.load(Ordering::Relaxed) != expected {}
         if flag.compare_exchange(expected, !expected, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            do_pause(pause_count);
             return;
         }
     }
@@ -139,8 +149,9 @@ fn ttas_cas(flag: &AtomicBool, expected: bool) {
 
 /// Retry the CAS itself until it succeeds. See [`SpinMode::Bare`].
 #[inline(always)]
-fn bare_cas(flag: &AtomicBool, expected: bool) {
+fn bare_cas(flag: &AtomicBool, expected: bool, pause_count: u32) {
     while flag.compare_exchange(expected, !expected, Ordering::Relaxed, Ordering::Relaxed).is_err() {}
+    do_pause(pause_count);
 }
 
 impl super::Bench for Bench {
@@ -164,10 +175,11 @@ impl super::Bench for Bench {
                 let flag = state.flag();
                 let n = num_round_trips as u64 * num_samples as u64;
 
+                let pc = state.pause_count;
                 state.barrier.wait();
                 match state.spin {
-                    SpinMode::Bare => for _ in 0..n { bare_cas(flag, PING) },
-                    SpinMode::Ttas => for _ in 0..n { ttas_cas(flag, PING) },
+                    SpinMode::Bare => for _ in 0..n { bare_cas(flag, PING, pc) },
+                    SpinMode::Ttas => for _ in 0..n { ttas_cas(flag, PING, pc) },
                 }
             });
 
@@ -179,13 +191,12 @@ impl super::Bench for Bench {
 
                 state.barrier.wait();
 
+                let pc = state.pause_count;
                 for _ in 0..num_samples {
                     let start = clock.raw();
-                    // The match is outside the inner loop, so the branch is
-                    // amortized over num_round_trips.
                     match state.spin {
-                        SpinMode::Bare => for _ in 0..num_round_trips { bare_cas(flag, PONG) },
-                        SpinMode::Ttas => for _ in 0..num_round_trips { ttas_cas(flag, PONG) },
+                        SpinMode::Bare => for _ in 0..num_round_trips { bare_cas(flag, PONG, pc) },
+                        SpinMode::Ttas => for _ in 0..num_round_trips { ttas_cas(flag, PONG, pc) },
                     }
                     let end = clock.raw();
                     let duration = clock.delta(start, end).as_nanos();

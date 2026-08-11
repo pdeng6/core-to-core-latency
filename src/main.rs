@@ -56,6 +56,13 @@ pub struct CliArgs {
     /// only the offset within one page, while 0,64,128,... land on unrelated pages.
     #[clap(long, require_delimiter=true, value_delimiter=',', default_value="0", value_parser)]
     slot: Vec<usize>,
+
+    /// Bench 1 only: number of PAUSE instructions to execute after each
+    /// successful CAS. Adds a fixed delay between flipping the flag and
+    /// returning, which separates the CAS latency from the back-to-back
+    /// retry pressure. Default 0 (no pause, original behavior).
+    #[clap(long, default_value_t = 0, value_parser)]
+    pause: u32,
 }
 
 fn main() {
@@ -86,7 +93,7 @@ fn main() {
             1 => {
                 // One instance for all slots: switching slots must be the only
                 // thing that changes between the sub-runs.
-                let cas = bench::cas::Bench::new(args.spin);
+                let cas = bench::cas::Bench::new(args.spin, args.pause);
                 for slot in &args.slot {
                     cas.set_slot(*slot);
                     let addr = cas.flag_addr() as usize;
@@ -96,8 +103,9 @@ fn main() {
                     };
                     eprintln!();
                     eprintln!("1) CAS latency on a single shared cache line \
-                               [spin={} slot={}/{} virt={:#x} phys={}]",
-                              args.spin, slot % bench::cas::Bench::num_slots(),
+                               [spin={} pause={} slot={}/{} virt={:#x} phys={}]",
+                              args.spin, args.pause,
+                              slot % bench::cas::Bench::num_slots(),
                               bench::cas::Bench::num_slots(), addr, phys);
                     eprintln!();
                     run_bench(&cores, &clock, &args, &cas);
