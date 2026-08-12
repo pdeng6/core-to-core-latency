@@ -62,7 +62,10 @@ pub struct CliArgs {
     /// 0,1,2,...: insert exactly N PAUSEs (default 0). {n}
     /// auto: for each slot, find the pause count that minimizes latency.
     ///       Runs a calibration pass, then measures each slot at its optimal
-    ///       pause count +/- 1.
+    ///       pause count (N-3..N where N=baseline/pause_ns). {n}
+    /// auto-matrix: like auto but sweeps core pairs instead of slots.
+    ///       For each pair in --cores, finds the optimal pause at slot=0.
+    ///       Use with multiple cores to get a contention-free latency matrix.
     #[clap(long, default_value = "0", value_parser)]
     pause: String,
 }
@@ -159,6 +162,90 @@ fn run_auto_pause(cores: &[core_affinity::CoreId], clock: &Arc<Clock>, args: &Cl
               (sum_base / cnt - sum_best / cnt) / (sum_base / cnt) * 100.0);
 }
 
+fn run_auto_pause_matrix(cores: &[core_affinity::CoreId], clock: &Arc<Clock>, args: &CliArgs) {
+    let cas = bench::cas::Bench::new(args.spin, 0);
+    cas.set_slot(0);
+
+    let addr = cas.flag_addr() as usize;
+    let phys = match crate::utils::virt_to_phys(addr) {
+        Some(p) => format!("{:#x}", p),
+        None => "-".to_string(),
+    };
+    eprintln!("slot=0 phys={}", phys);
+
+    // 1. Measure PAUSE latency
+    let pause_ns = bench::cas::measure_pause_ns(clock);
+
+    let n_cores = cores.len();
+    eprintln!("auto-pause-matrix: {} cores, {} pairs, slot=0",
+              n_cores, n_cores * (n_cores - 1) / 2);
+    eprintln!();
+    eprintln!("{:>5} {:>5} {:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10}",
+              "core1", "core2", "baseline", "N", "N-3", "N-2", "N-1", "N", "best_lat");
+
+    let mut sum_base = 0.0;
+    let mut sum_best = 0.0;
+    let mut count = 0usize;
+
+    for i in 0..n_cores {
+        for j in 0..i {
+            let pair = (cores[i], cores[j]);
+
+            // Baseline: pause=0
+            cas.set_pause_count(0);
+            let results = cas.run(pair, clock, args.num_iterations, args.num_samples);
+            let baseline = results.iter().sum::<f64>() / results.len() as f64;
+
+            // Compute N and candidates
+            let n = (baseline / pause_ns).floor() as u32;
+            let candidates: Vec<u32> = (n.saturating_sub(3)..=n).collect();
+
+            let mut best_lat = f64::MAX;
+            let mut best_pc = 0u32;
+            let mut lats: Vec<(u32, f64)> = Vec::new();
+
+            for &pc in &candidates {
+                cas.set_pause_count(pc);
+                let results = cas.run(pair, clock, args.num_iterations, args.num_samples);
+                let mean = results.iter().sum::<f64>() / results.len() as f64;
+                lats.push((pc, mean));
+                if mean < best_lat {
+                    best_lat = mean;
+                    best_pc = pc;
+                }
+            }
+
+            let lat_strs: Vec<String> = lats.iter()
+                .map(|&(pc, lat)| {
+                    if pc == best_pc { format!("*{:.1}", lat) } else { format!("{:.1}", lat) }
+                })
+                .collect();
+
+            let empty = "-".to_string();
+            let padded: Vec<&str> = {
+                let pad_count = 4 - lat_strs.len();
+                let mut v: Vec<&str> = (0..pad_count).map(|_| empty.as_str()).collect();
+                v.extend(lat_strs.iter().map(|s| s.as_str()));
+                v
+            };
+
+            eprintln!("{:>5} {:>5} {:>10.1} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10.1}",
+                      cores[i].id, cores[j].id, baseline, n,
+                      padded[0], padded[1], padded[2], padded[3], best_lat);
+
+            sum_base += baseline;
+            sum_best += best_lat;
+            count += 1;
+        }
+    }
+
+    eprintln!();
+    eprintln!("mean: baseline={:.1}ns  auto-pause={:.1}ns  improvement={:.1}ns ({:.1}%)",
+              sum_base / count as f64, sum_best / count as f64,
+              sum_base / count as f64 - sum_best / count as f64,
+              (sum_base / count as f64 - sum_best / count as f64) / (sum_base / count as f64) * 100.0);
+}
+
 fn main() {
     let args = CliArgs::parse();
 
@@ -187,6 +274,8 @@ fn main() {
             1 => {
                 if args.pause == "auto" {
                     run_auto_pause(&cores, &clock, &args);
+                } else if args.pause == "auto-matrix" {
+                    run_auto_pause_matrix(&cores, &clock, &args);
                 } else {
                     let pause_count: u32 = args.pause.parse()
                         .expect("--pause must be a number or 'auto'");

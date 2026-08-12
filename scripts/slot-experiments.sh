@@ -18,6 +18,8 @@
 #      and sweeps pause=1..floor(baseline_mean / pause_ns).
 #   5  Per-slot optimal PAUSE: for each slot, find the pause count that minimizes
 #      latency (--pause auto). Shows how much contention overhead is removable.
+#   6  Per-core-pair optimal PAUSE: for each pair in CORES, find the optimal
+#      pause at slot=0 (--pause auto-matrix). Contention-free latency matrix.
 #
 # Environment variables:
 #   STEPS         which steps to run, comma-separated (default: 1,2,3,4)
@@ -55,8 +57,8 @@ CORES=${CORES:-2,7}
 MEMNODE=${MEMNODE:-0}
 OUTDIR=${OUTDIR:-/tmp/slot-exp-$(date +%Y%m%d-%H%M%S)}
 
-# Which steps to run: comma-separated, e.g. STEPS=1,2,3,4,5 (default: all).
-STEPS=${STEPS:-1,2,3,4,5}
+# Which steps to run: comma-separated, e.g. STEPS=1,2,3,4,5,6 (default: all).
+STEPS=${STEPS:-1,2,3,4,5,6}
 run_step_enabled() { echo ",$STEPS," | grep -q ",$1,"; }
 
 # Step 4: explicit pause values to sweep. If set, skips auto-calibration.
@@ -115,6 +117,7 @@ cores=$CORES  membind=$MEMNODE  outdir=$OUTDIR  steps=$STEPS
   4     page 0 x $REPS3, pause=1..N            ~N*$((LINES_PER_PAGE * REPS3))         ${BASE_ITER}x${BASE_SAMPLES}     ~$(fmt "$E4_APPROX")
         (N = baseline_mean / pause_ns, auto-calibrated)
   5     per-slot optimal pause (--pause auto)  $((LINES_PER_PAGE + LINES_PER_PAGE * 4))         ${BASE_ITER}x${BASE_SAMPLES}     ~$(fmt "$(est_secs "$BASE_ITER" "$BASE_SAMPLES" $((LINES_PER_PAGE + LINES_PER_PAGE * 4)))")
+  6     per-pair optimal pause (auto-matrix)  ~$(echo "$CORES" | awk -F, '{n=NF; print n*(n-1)/2*5}')         ${BASE_ITER}x${BASE_SAMPLES}     ~$(fmt "$(est_secs "$BASE_ITER" "$BASE_SAMPLES" "$(echo "$CORES" | awk -F, '{n=NF; print n*(n-1)/2*5}')")")
 
 EOF
 }
@@ -330,11 +333,15 @@ pre_run_freq_check() {
         local tpid=$!
     fi
 
-    # Run a short benchmark (same binary, same cores) long enough for turbostat
+    # Run a short benchmark on just the first two cores, long enough for turbostat
     # to see at least 2 full intervals of busy-state. At ~63ns/round-trip and
     # 1s turbostat interval, we need ~3s of load: 5000 iter x 5000 samples ≈ 3s.
+    # Only two cores are needed to generate load; using the full CORES list would
+    # run the entire N×N matrix which is far too slow.
+    local prerun_cores
+    prerun_cores=$(echo "$CORES" | awk -F, '{print $1","$2}')
     numactl --membind="$MEMNODE" "$BIN" 5000 5000 -b 1 \
-            --cores "$CORES" --slot 0 > /dev/null 2>&1
+            --cores "$prerun_cores" --slot 0 > /dev/null 2>&1
 
     # Sample uncore during the tail end (benchmark is done but turbostat has
     # one more interval to report)
@@ -828,6 +835,104 @@ awk "$STDDEV_AWK"'
     }' "$OUTDIR/step5-auto.tsv" >> "$STATS_CSV"
 
 fi # step 5
+
+# --- step 6: per-core-pair optimal PAUSE (--pause auto-matrix) ---------------
+if run_step_enabled 6; then
+
+echo
+echo "== step6: per-core-pair optimal pause (--pause auto-matrix) =="
+numactl --membind="$MEMNODE" "$BIN" "$BASE_ITER" "$BASE_SAMPLES" -b 1 \
+        --cores "$CORES" --pause auto-matrix > "$OUTDIR/step6-matrix.out" 2>&1
+echo "   rc=$? -> $OUTDIR/step6-matrix.out"
+
+# Parse output: lines like "    7     2       63.7        4     66.4     69.7    *65.2     73.0       65.2"
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/step6-matrix.out" | awk '
+    /^slot=0 phys=/ { phys = $0; sub(/.*phys=/, "", phys) }
+    /^ *[0-9]+ +[0-9]+ +[0-9]/ && NF >= 9 {
+        c1 = $1; c2 = $2; base = $3; n_val = $4
+        best_lat = $NF
+        best_pc = ""
+        trials = ""
+        for (i = 5; i < NF; i++) {
+            pc = n_val - (NF - 1 - i)
+            lat = $i
+            gsub(/\*/, "", lat)
+            if ($i ~ /^\*/) best_pc = pc
+            trials = trials (trials == "" ? "" : ",") pc ":" lat
+        }
+        print c1, c2, base, best_pc, best_lat, trials
+    }
+    END { if (phys != "") print "# phys=" phys }
+' > "$OUTDIR/step6-matrix.tsv"
+
+# Count pairs (excluding the comment line)
+NPAIRS=$(grep -v "^#" "$OUTDIR/step6-matrix.tsv" | wc -l)
+PHYS=$(grep "^# phys=" "$OUTDIR/step6-matrix.tsv" | sed 's/# phys=//')
+echo "   ${NPAIRS} pairs, slot=0 phys=${PHYS:-unavailable} -> $OUTDIR/step6-matrix.tsv"
+
+# Extract the summary line from benchmark output
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/step6-matrix.out" | grep "^mean:" | sed 's/^/   /'
+
+echo
+echo "-- step6: per-core-pair results --"
+printf "  %-5s %-5s %10s %8s %10s  %s\n" "core1" "core2" "baseline" "best_pc" "best_lat" "trials"
+grep -v "^#" "$OUTDIR/step6-matrix.tsv" | \
+    awk '{ printf "  %-5s %-5s %10s %8s %10s  %s\n", $1, $2, $3, $4, $5, $6 }'
+
+echo
+echo "-- step6: summary statistics --"
+grep -v "^#" "$OUTDIR/step6-matrix.tsv" | awk "$STDDEV_AWK"'
+    { n++; base[n]=$3; best[n]=$5; sb+=$3; sbt+=$5
+      if(n==1||$3<bmin)bmin=$3; if($3>bmax)bmax=$3
+      if(n==1||$5<tmin)tmin=$5; if($5>tmax)tmax=$5 }
+    END {
+        bm=sb/n; tm=sbt/n; bsd=stddev(base,n); tsd=stddev(best,n)
+        printf "  %-14s %10s %10s %10s %10s %10s %10s\n", "", "mean", "stddev", "RSD%", "min", "max", "range"
+        printf "  %-14s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n", "baseline", bm, bsd, rsd(bsd,bm), bmin, bmax, bmax-bmin
+        printf "  %-14s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n", "auto-pause", tm, tsd, rsd(tsd,tm), tmin, tmax, tmax-tmin
+        printf "  %-14s %10.2f %10s %10s %10s %10s %10s\n", "improvement", bm-tm, "-", "-", "-", "-", "-"
+        printf "  %-14s %10.1f%% %9s %10s %10s %10s %10s\n", "improvement%", (bm-tm)/bm*100, "-", "-", "-", "-", "-"
+    }'
+
+# Bar chart: baseline vs auto-pause
+echo
+echo "-- step6: latency distribution, baseline vs auto-pause (2ns bins) --"
+grep -v "^#" "$OUTDIR/step6-matrix.tsv" | awk '{ print $3 }' | sort -n > "$OUTDIR/dist-step6-baseline.txt"
+grep -v "^#" "$OUTDIR/step6-matrix.tsv" | awk '{ print $5 }' | sort -n > "$OUTDIR/dist-step6-autopause.txt"
+
+awk -v f1="$OUTDIR/dist-step6-baseline.txt" -v f2="$OUTDIR/dist-step6-autopause.txt" '
+    BEGIN {
+        bin = 2; scale = 3
+        while ((getline v < f1) > 0) { h1[int(v/bin)]++; if(!lo||v<lo)lo=v; if(v>hi)hi=v }
+        close(f1)
+        while ((getline v < f2) > 0) { h2[int(v/bin)]++; if(!lo||v<lo)lo=v; if(v>hi)hi=v }
+        close(f2)
+        printf "  %-9s %-20s %-20s\n", "bin(ns)", "baseline", "auto-pause"
+        for (b = int(lo/bin); b <= int(hi/bin); b++) {
+            if (h1[b]+0 == 0 && h2[b]+0 == 0) continue
+            printf "  %3.0f-%-5.0f", b*bin, (b+1)*bin
+            bar1 = ""; cnt = int((h1[b]+0+scale-1)/scale)
+            for (j = 0; j < cnt; j++) bar1 = bar1 "#"
+            bar2 = ""; cnt = int((h2[b]+0+scale-1)/scale)
+            for (j = 0; j < cnt; j++) bar2 = bar2 "#"
+            printf " %-20s %-20s\n", bar1, bar2
+        }
+    }' /dev/null
+
+# Append to stats.csv
+grep -v "^#" "$OUTDIR/step6-matrix.tsv" | awk "$STDDEV_AWK"'
+    { n++; base[n]=$3; best[n]=$5; sb+=$3; sbt+=$5
+      if(n==1||$3<bmin)bmin=$3; if($3>bmax)bmax=$3
+      if(n==1||$5<tmin)tmin=$5; if($5>tmax)tmax=$5 }
+    END {
+        bm=sb/n; tm=sbt/n; bsd=stddev(base,n); tsd=stddev(best,n)
+        printf "step6-baseline,%s,%s,1,%d,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\n",
+               "'"$BASE_ITER"'","'"$BASE_SAMPLES"'",n,bm,bsd,rsd(bsd,bm),bmin,bmax,bmax-bmin
+        printf "step6-autopause,%s,%s,1,%d,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\n",
+               "'"$BASE_ITER"'","'"$BASE_SAMPLES"'",n,tm,tsd,rsd(tsd,tm),tmin,tmax,tmax-tmin
+    }' >> "$STATS_CSV"
+
+fi # step 6
 
 # --- distribution comparison (runs if step 2 and 3 both ran) ----------------
 per_slot_means() { # tsv
