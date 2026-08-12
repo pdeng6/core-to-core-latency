@@ -165,8 +165,7 @@ fi
 # Uncore: raise min_freq_khz to max_freq_khz on every uncore domain. The PCU
 # only ramps uncore when it sees mesh traffic, and a two-thread c2c benchmark
 # doesn't generate enough, so without pinning the uncore sits well below its
-# ceiling and inflates latency. This is the effect described in point 2 of the
-# investigation summary (DMR 131→100ns after uncore pin).
+# ceiling and inflates latency.
 
 CORE_FREQ_SAVED=""
 UNCORE_FREQ_SAVED=""
