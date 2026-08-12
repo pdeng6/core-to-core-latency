@@ -16,6 +16,8 @@
 #      If PAUSE_LIST is set (e.g. "1,2,3"), runs exactly those pause values.
 #      Otherwise, auto-calibrates: measures PAUSE latency, runs a quick baseline,
 #      and sweeps pause=1..floor(baseline_mean / pause_ns).
+#   5  Per-slot optimal PAUSE: for each slot, find the pause count that minimizes
+#      latency (--pause auto). Shows how much contention overhead is removable.
 #
 # Environment variables:
 #   STEPS         which steps to run, comma-separated (default: 1,2,3,4)
@@ -53,8 +55,8 @@ CORES=${CORES:-2,7}
 MEMNODE=${MEMNODE:-0}
 OUTDIR=${OUTDIR:-/tmp/slot-exp-$(date +%Y%m%d-%H%M%S)}
 
-# Which steps to run: comma-separated, e.g. STEPS=1,2,3,4 (default: all).
-STEPS=${STEPS:-1,2,3,4}
+# Which steps to run: comma-separated, e.g. STEPS=1,2,3,4,5 (default: all).
+STEPS=${STEPS:-1,2,3,4,5}
 run_step_enabled() { echo ",$STEPS," | grep -q ",$1,"; }
 
 # Step 4: explicit pause values to sweep. If set, skips auto-calibration.
@@ -112,6 +114,7 @@ cores=$CORES  membind=$MEMNODE  outdir=$OUTDIR  steps=$STEPS
   3     page 0 x $REPS3 repeats, longer             $((LINES_PER_PAGE * REPS3))         ${LONG_ITER}x${LONG_SAMPLES}    $(fmt "$E3")
   4     page 0 x $REPS3, pause=1..N            ~N*$((LINES_PER_PAGE * REPS3))         ${BASE_ITER}x${BASE_SAMPLES}     ~$(fmt "$E4_APPROX")
         (N = baseline_mean / pause_ns, auto-calibrated)
+  5     per-slot optimal pause (--pause auto)  $((LINES_PER_PAGE + LINES_PER_PAGE * 4))         ${BASE_ITER}x${BASE_SAMPLES}     ~$(fmt "$(est_secs "$BASE_ITER" "$BASE_SAMPLES" $((LINES_PER_PAGE + LINES_PER_PAGE * 4)))")
 
 EOF
 }
@@ -730,6 +733,102 @@ for pc in $PAUSE_VALUES; do
 done
 
 fi # step 4
+
+# --- step 5: per-slot optimal PAUSE (--pause auto) --------------------------
+if run_step_enabled 5; then
+
+echo
+echo "== step5: per-slot optimal pause (--pause auto) =="
+numactl --membind="$MEMNODE" "$BIN" "$BASE_ITER" "$BASE_SAMPLES" -b 1 \
+        --cores "$CORES" --slot "$(seq -s, 0 $((LINES_PER_PAGE - 1)))" \
+        --pause auto > "$OUTDIR/step5-auto.out" 2>&1
+echo "   rc=$? -> $OUTDIR/step5-auto.out"
+
+# Parse the output. The benchmark prints lines like:
+#   0  0x183b5a5000  108.3  11  *97.3  101.5  103.7  107.1  97.3
+# Fields: slot, phys, baseline, N, lat_N-3, lat_N-2, lat_N-1, lat_N, best_lat
+# The * prefix marks the best. We extract: slot phys baseline best_pc best_lat trials
+# where trials is e.g. "8:97.3,9:101.5,10:103.7,11:107.1"
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/step5-auto.out" | awk '
+    /^ *[0-9]+ +0x/ || /^ *[0-9]+ +-/ {
+        slot = $1; phys = $2; base = $3; n_val = $4
+        best_lat = $NF
+        best_pc = ""
+        trials = ""
+        for (i = 5; i < NF; i++) {
+            pc = n_val - (NF - 1 - i)
+            lat = $i
+            gsub(/\*/, "", lat)
+            if ($i ~ /^\*/) best_pc = pc
+            trials = trials (trials == "" ? "" : ",") pc ":" lat
+        }
+        print slot, phys, base, best_pc, best_lat, trials
+    }
+' > "$OUTDIR/step5-auto.tsv"
+echo "   $(wc -l < "$OUTDIR/step5-auto.tsv") slots -> $OUTDIR/step5-auto.tsv"
+
+# Extract the summary line
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/step5-auto.out" | grep "^mean:" | sed 's/^/   /'
+
+echo
+echo "-- step5: per-slot results --"
+printf "  %-5s %-18s %10s %8s %10s  %s\n" "slot" "phys" "baseline" "best_pc" "best_lat" "trials"
+awk '{ printf "  %-5s %-18s %10s %8s %10s  %s\n", $1, $2, $3, $4, $5, $6 }' "$OUTDIR/step5-auto.tsv"
+
+echo
+echo "-- step5: summary statistics --"
+awk "$STDDEV_AWK"'
+    { n++; base[n]=$3; best[n]=$5; sb+=$3; sbt+=$5
+      if(n==1||$3<bmin)bmin=$3; if($3>bmax)bmax=$3
+      if(n==1||$5<tmin)tmin=$5; if($5>tmax)tmax=$5 }
+    END {
+        bm=sb/n; tm=sbt/n; bsd=stddev(base,n); tsd=stddev(best,n)
+        printf "  %-14s %10s %10s %10s %10s %10s %10s\n", "", "mean", "stddev", "RSD%", "min", "max", "range"
+        printf "  %-14s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n", "baseline", bm, bsd, rsd(bsd,bm), bmin, bmax, bmax-bmin
+        printf "  %-14s %10.2f %10.2f %10.2f %10.2f %10.2f %10.2f\n", "auto-pause", tm, tsd, rsd(tsd,tm), tmin, tmax, tmax-tmin
+        printf "  %-14s %10.2f %10s %10s %10s %10s %10s\n", "improvement", bm-tm, "-", "-", "-", "-", "-"
+        printf "  %-14s %10.1f%% %9s %10s %10s %10s %10s\n", "improvement%", (bm-tm)/bm*100, "-", "-", "-", "-", "-"
+    }' "$OUTDIR/step5-auto.tsv"
+
+# Bar chart: baseline vs auto-pause, side by side
+echo
+echo "-- step5: latency distribution, baseline vs auto-pause (2ns bins) --"
+awk '{ print $3 }' "$OUTDIR/step5-auto.tsv" | sort -n > "$OUTDIR/dist-step5-baseline.txt"
+awk '{ print $5 }' "$OUTDIR/step5-auto.tsv" | sort -n > "$OUTDIR/dist-step5-autopause.txt"
+
+awk -v f1="$OUTDIR/dist-step5-baseline.txt" -v f2="$OUTDIR/dist-step5-autopause.txt" '
+    BEGIN {
+        bin = 2; scale = 3
+        while ((getline v < f1) > 0) { h1[int(v/bin)]++; if(!lo||v<lo)lo=v; if(v>hi)hi=v }
+        close(f1)
+        while ((getline v < f2) > 0) { h2[int(v/bin)]++; if(!lo||v<lo)lo=v; if(v>hi)hi=v }
+        close(f2)
+        printf "  %-9s %-20s %-20s\n", "bin(ns)", "baseline", "auto-pause"
+        for (b = int(lo/bin); b <= int(hi/bin); b++) {
+            if (h1[b]+0 == 0 && h2[b]+0 == 0) continue
+            printf "  %3.0f-%-5.0f", b*bin, (b+1)*bin
+            bar1 = ""; cnt = int((h1[b]+0+scale-1)/scale)
+            for (j = 0; j < cnt; j++) bar1 = bar1 "#"
+            bar2 = ""; cnt = int((h2[b]+0+scale-1)/scale)
+            for (j = 0; j < cnt; j++) bar2 = bar2 "#"
+            printf " %-20s %-20s\n", bar1, bar2
+        }
+    }' /dev/null
+
+# Also append to stats.csv
+awk "$STDDEV_AWK"'
+    { n++; base[n]=$3; best[n]=$5; sb+=$3; sbt+=$5
+      if(n==1||$3<bmin)bmin=$3; if($3>bmax)bmax=$3
+      if(n==1||$5<tmin)tmin=$5; if($5>tmax)tmax=$5 }
+    END {
+        bm=sb/n; tm=sbt/n; bsd=stddev(base,n); tsd=stddev(best,n)
+        printf "step5-baseline,%s,%s,1,%d,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\n",
+               "'"$BASE_ITER"'","'"$BASE_SAMPLES"'",n,bm,bsd,rsd(bsd,bm),bmin,bmax,bmax-bmin
+        printf "step5-autopause,%s,%s,1,%d,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\n",
+               "'"$BASE_ITER"'","'"$BASE_SAMPLES"'",n,tm,tsd,rsd(tsd,tm),tmin,tmax,tmax-tmin
+    }' "$OUTDIR/step5-auto.tsv" >> "$STATS_CSV"
+
+fi # step 5
 
 # --- distribution comparison (runs if step 2 and 3 both ran) ----------------
 per_slot_means() { # tsv

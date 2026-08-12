@@ -1,7 +1,7 @@
 use core_affinity::CoreId;
 use std::fmt;
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use quanta::Clock;
 use super::Count;
 
@@ -88,7 +88,7 @@ pub struct Bench {
     pages: Vec<Page>,
     slot: AtomicUsize,
     spin: SpinMode,
-    pause_count: u32,
+    pause_count: AtomicU32,
 }
 
 impl Bench {
@@ -107,7 +107,7 @@ impl Bench {
             pages,
             slot: AtomicUsize::new(0),
             spin,
-            pause_count,
+            pause_count: AtomicU32::new(pause_count),
         }
     }
 
@@ -126,6 +126,14 @@ impl Bench {
     pub fn flag_addr(&self) -> *const AtomicBool {
         self.flag() as *const AtomicBool
     }
+
+    pub fn set_pause_count(&self, pc: u32) {
+        self.pause_count.store(pc, Ordering::Relaxed);
+    }
+
+    pub fn pause_count(&self) -> u32 {
+        self.pause_count.load(Ordering::Relaxed)
+    }
 }
 
 #[inline(always)]
@@ -133,6 +141,47 @@ fn do_pause(n: u32) {
     for _ in 0..n {
         unsafe { std::arch::x86_64::_mm_pause() };
     }
+}
+
+/// Measure the cost of a single PAUSE instruction in nanoseconds using a
+/// dependent-add chain for frequency calibration (same method as measure-pause.c).
+pub fn measure_pause_ns(clock: &quanta::Clock) -> f64 {
+    use std::arch::x86_64::_mm_pause;
+
+    // Calibrate: 1024 dependent adds = 1024 core cycles.
+    let freq_loops: u64 = 100_000;
+    // warmup
+    for _ in 0..100 {
+        unsafe { std::arch::asm!(
+            "xor %eax, %eax",
+            ".rept 1024", "add $1, %eax", ".endr",
+            out("eax") _, options(att_syntax, nostack)
+        ); }
+    }
+    let t0 = clock.raw();
+    for _ in 0..freq_loops {
+        unsafe { std::arch::asm!(
+            "xor %eax, %eax",
+            ".rept 1024", "add $1, %eax", ".endr",
+            out("eax") _, options(att_syntax, nostack)
+        ); }
+    }
+    let t1 = clock.raw();
+    let ns_per_1024_cycles = clock.delta(t0, t1).as_nanos() as f64 / freq_loops as f64;
+    let core_freq_ghz = 1024.0 / ns_per_1024_cycles;
+
+    // Measure PAUSE
+    let pause_loops: u64 = 10_000_000;
+    for _ in 0..1000 { unsafe { _mm_pause() }; }
+    let t0 = clock.raw();
+    for _ in 0..pause_loops { unsafe { _mm_pause() }; }
+    let t1 = clock.raw();
+    let ns_per_pause = clock.delta(t0, t1).as_nanos() as f64 / pause_loops as f64;
+    let cycles_per_pause = ns_per_pause * core_freq_ghz;
+
+    eprintln!("PAUSE calibration: {:.2}ns = {:.1} core cycles (core freq {:.0} MHz)",
+              ns_per_pause, cycles_per_pause, core_freq_ghz * 1000.0);
+    ns_per_pause
 }
 
 /// Spin on a load before attempting the CAS. See [`SpinMode::Ttas`].
@@ -175,7 +224,7 @@ impl super::Bench for Bench {
                 let flag = state.flag();
                 let n = num_round_trips as u64 * num_samples as u64;
 
-                let pc = state.pause_count;
+                let pc = state.pause_count();
                 state.barrier.wait();
                 match state.spin {
                     SpinMode::Bare => for _ in 0..n { bare_cas(flag, PING, pc) },
@@ -191,7 +240,7 @@ impl super::Bench for Bench {
 
                 state.barrier.wait();
 
-                let pc = state.pause_count;
+                let pc = state.pause_count();
                 for _ in 0..num_samples {
                     let start = clock.raw();
                     match state.spin {

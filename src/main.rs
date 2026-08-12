@@ -3,6 +3,7 @@ mod utils;
 
 use bench::Count;
 use bench::cas::SpinMode;
+use bench::Bench as _;
 use std::sync::Arc;
 use clap::Parser;
 use quanta::Clock;
@@ -57,12 +58,105 @@ pub struct CliArgs {
     #[clap(long, require_delimiter=true, value_delimiter=',', default_value="0", value_parser)]
     slot: Vec<usize>,
 
-    /// Bench 1 only: number of PAUSE instructions to execute after each
-    /// successful CAS. Adds a fixed delay between flipping the flag and
-    /// returning, which separates the CAS latency from the back-to-back
-    /// retry pressure. Default 0 (no pause, original behavior).
-    #[clap(long, default_value_t = 0, value_parser)]
-    pause: u32,
+    /// Bench 1 only: PAUSE instructions after each successful CAS. {n}
+    /// 0,1,2,...: insert exactly N PAUSEs (default 0). {n}
+    /// auto: for each slot, find the pause count that minimizes latency.
+    ///       Runs a calibration pass, then measures each slot at its optimal
+    ///       pause count +/- 1.
+    #[clap(long, default_value = "0", value_parser)]
+    pause: String,
+}
+
+fn run_auto_pause(cores: &[core_affinity::CoreId], clock: &Arc<Clock>, args: &CliArgs) {
+    let cas = bench::cas::Bench::new(args.spin, 0);
+    let num_slots = bench::cas::Bench::num_slots();
+
+    // 1. Measure PAUSE latency
+    let pause_ns = bench::cas::measure_pause_ns(clock);
+
+    // 2. Calibration pass: measure each slot with pause=0
+    eprintln!("auto-pause: calibration pass (pause=0, all {} slots)...", args.slot.len());
+    cas.set_pause_count(0);
+    let mut baselines: Vec<(usize, f64)> = Vec::new();
+    for &slot in &args.slot {
+        cas.set_slot(slot);
+        let results = cas.run(
+            (cores[0], cores[1]), clock,
+            args.num_iterations, args.num_samples,
+        );
+        let mean = results.iter().sum::<f64>() / results.len() as f64;
+        baselines.push((slot % num_slots, mean));
+    }
+
+    // 3. For each slot, compute target pause N = floor(baseline/pause_ns),
+    //    then measure at N-3, N-2, N-1, N to find the minimum.
+    eprintln!("auto-pause: measurement pass (per-slot, pause = N-3..N)...");
+    eprintln!();
+    eprintln!("{:>5} {:>18} {:>10} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10}",
+              "slot", "phys", "baseline", "N", "N-3", "N-2", "N-1", "N", "best_lat");
+
+    let mut sum_base = 0.0;
+    let mut sum_best = 0.0;
+
+    for &(slot, baseline) in &baselines {
+        let n = (baseline / pause_ns).floor() as u32;
+        let candidates: Vec<u32> = (n.saturating_sub(3)..=n).collect();
+
+        let mut best_lat = f64::MAX;
+        let mut best_pc = 0u32;
+        let mut lats: Vec<(u32, f64)> = Vec::new();
+
+        cas.set_slot(slot);
+        for &pc in &candidates {
+            cas.set_pause_count(pc);
+            let results = cas.run(
+                (cores[0], cores[1]), clock,
+                args.num_iterations, args.num_samples,
+            );
+            let mean = results.iter().sum::<f64>() / results.len() as f64;
+            lats.push((pc, mean));
+            if mean < best_lat {
+                best_lat = mean;
+                best_pc = pc;
+            }
+        }
+
+        let addr = cas.flag_addr() as usize;
+        let phys = match crate::utils::virt_to_phys(addr) {
+            Some(p) => format!("{:#x}", p),
+            None => "-".to_string(),
+        };
+
+        // Format each candidate's latency, mark the best with *
+        let lat_strs: Vec<String> = lats.iter()
+            .map(|&(pc, lat)| {
+                if pc == best_pc { format!("*{:.1}", lat) } else { format!("{:.1}", lat) }
+            })
+            .collect();
+
+        // Pad to always show 4 columns (in case N < 3, fewer candidates)
+        let empty = "-".to_string();
+        let padded: Vec<&str> = {
+            let pad_count = 4 - lat_strs.len();
+            let mut v: Vec<&str> = (0..pad_count).map(|_| empty.as_str()).collect();
+            v.extend(lat_strs.iter().map(|s| s.as_str()));
+            v
+        };
+
+        eprintln!("{:>5} {:>18} {:>10.1} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10.1}",
+                  slot, phys, baseline, n,
+                  padded[0], padded[1], padded[2], padded[3], best_lat);
+
+        sum_base += baseline;
+        sum_best += best_lat;
+    }
+
+    let cnt = baselines.len() as f64;
+    eprintln!();
+    eprintln!("mean: baseline={:.1}ns  auto-pause={:.1}ns  improvement={:.1}ns ({:.1}%)",
+              sum_base / cnt, sum_best / cnt,
+              sum_base / cnt - sum_best / cnt,
+              (sum_base / cnt - sum_best / cnt) / (sum_base / cnt) * 100.0);
 }
 
 fn main() {
@@ -91,24 +185,28 @@ fn main() {
     for b in &args.bench {
         match b {
             1 => {
-                // One instance for all slots: switching slots must be the only
-                // thing that changes between the sub-runs.
-                let cas = bench::cas::Bench::new(args.spin, args.pause);
-                for slot in &args.slot {
-                    cas.set_slot(*slot);
-                    let addr = cas.flag_addr() as usize;
-                    let phys = match utils::virt_to_phys(addr) {
-                        Some(p) => format!("{:#x}", p),
-                        None => "unavailable (needs root)".to_string(),
-                    };
-                    eprintln!();
-                    eprintln!("1) CAS latency on a single shared cache line \
-                               [spin={} pause={} slot={}/{} virt={:#x} phys={}]",
-                              args.spin, args.pause,
-                              slot % bench::cas::Bench::num_slots(),
-                              bench::cas::Bench::num_slots(), addr, phys);
-                    eprintln!();
-                    run_bench(&cores, &clock, &args, &cas);
+                if args.pause == "auto" {
+                    run_auto_pause(&cores, &clock, &args);
+                } else {
+                    let pause_count: u32 = args.pause.parse()
+                        .expect("--pause must be a number or 'auto'");
+                    let cas = bench::cas::Bench::new(args.spin, pause_count);
+                    for slot in &args.slot {
+                        cas.set_slot(*slot);
+                        let addr = cas.flag_addr() as usize;
+                        let phys = match utils::virt_to_phys(addr) {
+                            Some(p) => format!("{:#x}", p),
+                            None => "unavailable (needs root)".to_string(),
+                        };
+                        eprintln!();
+                        eprintln!("1) CAS latency on a single shared cache line \
+                                   [spin={} pause={} slot={}/{} virt={:#x} phys={}]",
+                                  args.spin, pause_count,
+                                  slot % bench::cas::Bench::num_slots(),
+                                  bench::cas::Bench::num_slots(), addr, phys);
+                        eprintln!();
+                        run_bench(&cores, &clock, &args, &cas);
+                    }
                 }
             }
             2 => {
