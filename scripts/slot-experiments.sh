@@ -2,7 +2,7 @@
 # Slot-placement experiments for bench 1.
 #
 # Usage:
-#   sudo ./slot-experiments.sh                     # run all 4 steps
+#   sudo ./slot-experiments.sh                     # run all steps (1-6)
 #   sudo STEPS=4 ./slot-experiments.sh             # run step 4 only
 #   sudo STEPS=1,2 ./slot-experiments.sh           # run steps 1 and 2
 #   sudo STEPS=4 PAUSE_LIST=5,6,7 ./slot-experiments.sh  # step 4 with specific pause values
@@ -24,7 +24,7 @@
 #      pause at slot=0 (--pause auto-matrix). Contention-free latency matrix.
 #
 # Environment variables:
-#   STEPS         which steps to run, comma-separated (default: 1,2,3,4)
+#   STEPS         which steps to run, comma-separated (default: 0,1,2,3,4,5,6)
 #   CORES         core pair to test (default: 2,7)
 #   MEMNODE       NUMA node for memory binding (default: 0)
 #   OUTDIR        output directory (default: /tmp/slot-exp-YYYYMMDD-HHMMSS)
@@ -59,9 +59,8 @@ CORES=${CORES:-2,7}
 MEMNODE=${MEMNODE:-0}
 OUTDIR=${OUTDIR:-/tmp/slot-exp-$(date +%Y%m%d-%H%M%S)}
 
-# Which steps to run: comma-separated, e.g. STEPS=0,1,2,3,4,5,6 (default: 1-6).
-# Step 0 is not in the default set (it's a standalone baseline run).
-STEPS=${STEPS:-1,2,3,4,5,6}
+# Which steps to run: comma-separated, e.g. STEPS=0,1,2,3,4,5,6 (default: all).
+STEPS=${STEPS:-0,1,2,3,4,5,6}
 run_step_enabled() { echo ",$STEPS," | grep -q ",$1,"; }
 
 # Step 4: explicit pause values to sweep. If set, skips auto-calibration.
