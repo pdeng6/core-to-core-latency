@@ -22,9 +22,11 @@
 #      latency (--pause auto). Shows how much contention overhead is removable.
 #   6  Per-core-pair optimal PAUSE: for each pair in CORES, find the optimal
 #      pause at slot=0 (--pause auto-matrix). Contention-free latency matrix.
+#   7  TTAS baseline matrix: same as step 0 but with --spin ttas. Shows whether
+#      load-spinning (Shared state) vs CAS-spinning (RFO) changes latency.
 #
 # Environment variables:
-#   STEPS         which steps to run, comma-separated (default: 0,1,2,3,4,5,6)
+#   STEPS         which steps to run, comma-separated (default: 0,1,2,3,4,5,6,7)
 #   CORES         core pair to test (default: 2,7)
 #   MEMNODE       NUMA node for memory binding (default: 0)
 #   OUTDIR        output directory (default: /tmp/slot-exp-YYYYMMDD-HHMMSS)
@@ -59,8 +61,8 @@ CORES=${CORES:-2,7}
 MEMNODE=${MEMNODE:-0}
 OUTDIR=${OUTDIR:-/tmp/slot-exp-$(date +%Y%m%d-%H%M%S)}
 
-# Which steps to run: comma-separated, e.g. STEPS=0,1,2,3,4,5,6 (default: all).
-STEPS=${STEPS:-0,1,2,3,4,5,6}
+# Which steps to run: comma-separated, e.g. STEPS=0,1,2,3,4,5,6,7 (default: all).
+STEPS=${STEPS:-0,1,2,3,4,5,6,7}
 run_step_enabled() { echo ",$STEPS," | grep -q ",$1,"; }
 
 # Step 4: explicit pause values to sweep. If set, skips auto-calibration.
@@ -550,7 +552,38 @@ echo "step0-baseline,$BASE_ITER,$BASE_SAMPLES,1,1,$STEP0_MEAN,-,-,-,-,-" >> "$ST
 
 fi # step 0
 
-# --- step 1: does one page stand in for all 16? -----------------------------
+# --- step 7: TTAS baseline matrix (all core pairs, pause=0, --spin ttas) -----
+# Same as step 0 but using test-and-test-and-set instead of bare CAS.
+# Comparing step 0 and step 7 shows whether spinning on a load (Shared state)
+# vs spinning on CAS (RFO each attempt) affects the round-trip latency.
+if run_step_enabled 7; then
+
+echo
+echo "== step7: TTAS baseline matrix (all core pairs, --spin ttas, pause=0) =="
+numactl --membind="$MEMNODE" "$BIN" "$BASE_ITER" "$BASE_SAMPLES" -b 1 \
+        --cores "$CORES" --spin ttas --pause 0 > "$OUTDIR/step7-ttas.out" 2>&1
+echo "   rc=$? -> $OUTDIR/step7-ttas.out"
+
+# Show the output
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/step7-ttas.out"
+
+# Extract mean from the output
+STEP7_MEAN=$(sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/step7-ttas.out" | awk '/Mean latency/{gsub(/ns/,""); print $3}')
+echo
+echo "   step7 (ttas) mean: ${STEP7_MEAN}ns"
+
+# Compare with step 0 if available
+if [ -n "${STEP0_MEAN:-}" ]; then
+    DIFF=$(awk -v a="$STEP0_MEAN" -v b="$STEP7_MEAN" 'BEGIN{printf "%.1f", b-a}')
+    echo "   vs step0 (bare): ${DIFF}ns"
+fi
+
+# Append to stats.csv
+echo "step7-ttas,$BASE_ITER,$BASE_SAMPLES,1,1,$STEP7_MEAN,-,-,-,-,-" >> "$STATS_CSV"
+
+fi # step 7
+
+# --- step 1: does one page enough, or do we need all 16? --------------------
 if run_step_enabled 1; then
 run_step step1-allslots "$BASE_ITER" "$BASE_SAMPLES" "$(seq -s, 0 $((NUM_SLOTS - 1)))" || exit 1
 append_stats step1-allslots "$BASE_ITER" "$BASE_SAMPLES" 1 "$OUTDIR/step1-allslots.tsv"

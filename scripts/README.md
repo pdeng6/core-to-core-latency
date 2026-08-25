@@ -70,6 +70,13 @@ DRY_RUN=1 ./scripts/slot-experiments.sh
 - **How to read**: Compare step 6 baseline mean vs step 0 mean (should match). Compare auto-pause mean to baseline — the gap is the contention overhead. Per-pair table shows which pairs benefit most.
 - **Time**: ~20 min (40 cores)
 
+### Step 7: TTAS Baseline Matrix
+
+- **What**: Same as step 0 but with `--spin ttas` (test-and-test-and-set).
+- **Purpose**: Determine whether spinning on a relaxed load (Shared state, no RFO) vs spinning on CAS (takes ownership each attempt) changes the round-trip latency.
+- **How to read**: Compare step 7 mean vs step 0 mean. If they match, the spin method doesn't matter — the coherence transfer itself dominates. If TTAS is faster, failed CAS ownership requests were adding overhead.
+- **Time**: Same as step 0
+
 ## Common Usage
 
 ```bash
@@ -85,6 +92,9 @@ sudo STEPS=5 CORES=24,31 BIN=./target/release/core-to-core-latency ./scripts/slo
 # Step 4 with explicit pause values (targeted re-run)
 sudo STEPS=4 PAUSE_LIST=5,6,7,8,9 BIN=./target/release/core-to-core-latency ./scripts/slot-experiments.sh
 
+# TTAS baseline matrix on cores 0-39 (compare with step 0)
+sudo STEPS=0,7 CORES=$(seq -s, 0 39) BIN=./target/release/core-to-core-latency ./scripts/slot-experiments.sh
+
 # Run on a remote host (binary pre-deployed)
 cd /path/to/deployed && STEPS=6 CORES=$(seq -s, 0 39) BIN=./core-to-core-latency ./slot-experiments.sh
 ```
@@ -93,7 +103,7 @@ cd /path/to/deployed && STEPS=6 CORES=$(seq -s, 0 39) BIN=./core-to-core-latency
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `STEPS` | `0,1,2,3,4,5,6` | Which steps to run (comma-separated) |
+| `STEPS` | `0,1,2,3,4,5,6,7` | Which steps to run (comma-separated) |
 | `CORES` | `2,7` | Core IDs to test |
 | `MEMNODE` | `0` | NUMA node for memory binding |
 | `OUTDIR` | `/tmp/slot-exp-YYYYMMDD-HHMMSS` | Output directory |
