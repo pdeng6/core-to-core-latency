@@ -9,6 +9,8 @@
 #   DRY_RUN=1 ./slot-experiments.sh                # just show plan, don't run
 #
 # Steps:
+#   0  Baseline matrix: all core pairs, pause=0, slot=0, with freq pinned
+#      and membind. The standard latency matrix under controlled conditions.
 #   1  Is one page enough, or do we need all 16?   (1024 slots, one pass)
 #   2  Is the per-slot value stable across repeats? (page 0 x N repeats)
 #   3  Does the answer hold with longer measurements? (page 0 x N, 4x iter)
@@ -57,7 +59,8 @@ CORES=${CORES:-2,7}
 MEMNODE=${MEMNODE:-0}
 OUTDIR=${OUTDIR:-/tmp/slot-exp-$(date +%Y%m%d-%H%M%S)}
 
-# Which steps to run: comma-separated, e.g. STEPS=1,2,3,4,5,6 (default: all).
+# Which steps to run: comma-separated, e.g. STEPS=0,1,2,3,4,5,6 (default: 1-6).
+# Step 0 is not in the default set (it's a standalone baseline run).
 STEPS=${STEPS:-1,2,3,4,5,6}
 run_step_enabled() { echo ",$STEPS," | grep -q ",$1,"; }
 
@@ -68,7 +71,7 @@ PAUSE_LIST=${PAUSE_LIST:-}
 # Path to the measure-pause binary (used by step 4 to calibrate PAUSE latency).
 MEASURE_PAUSE=${MEASURE_PAUSE:-$(dirname "$BIN")/../../scripts/measure-pause}
 
-# Steps 1-2: the customer's settings. Step 3: 4x the iterations per sample.
+# Steps 1-2: the default benchmark settings. Step 3: 4x the iterations per sample.
 BASE_ITER=${BASE_ITER:-5000}
 BASE_SAMPLES=${BASE_SAMPLES:-300}
 LONG_ITER=${LONG_ITER:-20000}
@@ -524,6 +527,29 @@ run_step() { # name iter samples slotlist [pause]
 
 # --- pre-run: verify frequencies under load ---------------------------------
 pre_run_freq_check
+
+# --- step 0: baseline matrix (all core pairs, pause=0, slot=0) ---------------
+# Standard latency matrix with frequencies pinned and memory bound.
+if run_step_enabled 0; then
+
+echo
+echo "== step0: baseline matrix (all core pairs, pause=0) =="
+numactl --membind="$MEMNODE" "$BIN" "$BASE_ITER" "$BASE_SAMPLES" -b 1 \
+        --cores "$CORES" --pause 0 > "$OUTDIR/step0-baseline.out" 2>&1
+echo "   rc=$? -> $OUTDIR/step0-baseline.out"
+
+# Show the output (it's the standard matrix format)
+sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/step0-baseline.out"
+
+# Extract mean from the output
+STEP0_MEAN=$(sed 's/\x1b\[[0-9;]*m//g' "$OUTDIR/step0-baseline.out" | awk '/Mean latency/{gsub(/ns/,""); print $3}')
+echo
+echo "   step0 mean: ${STEP0_MEAN}ns"
+
+# Append to stats.csv
+echo "step0-baseline,$BASE_ITER,$BASE_SAMPLES,1,1,$STEP0_MEAN,-,-,-,-,-" >> "$STATS_CSV"
+
+fi # step 0
 
 # --- step 1: does one page stand in for all 16? -----------------------------
 if run_step_enabled 1; then
